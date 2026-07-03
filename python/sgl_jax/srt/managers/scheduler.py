@@ -1535,6 +1535,11 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    def _cache_chunked_req_if_needed(self, req: Req):
+        if len(req.fill_ids) <= len(req.prefix_indices):
+            return
+        self.tree_cache.cache_unfinished_req(req)
+
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         # Process chunked requests for each DP rank
         chunked_req_to_exclude = {}
@@ -1543,7 +1548,7 @@ class Scheduler(
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
+                self._cache_chunked_req_if_needed(self.chunked_reqs[dp_rank])
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
