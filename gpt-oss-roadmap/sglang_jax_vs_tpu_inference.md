@@ -93,7 +93,10 @@ Raw per-point data: `sweep_sglang.txt`, `sweep_vllm.txt`, `COMPARISON.md`.
 
 ## Notes
 
-- **gpt-oss-120b cannot be compared** — tpu-inference only; sglang-jax has no gpt-oss model
-  module (only a comment referencing its activation in a MoE kernel).
+- **gpt-oss is now supported on SGLang-JAX** (this `gpt-oss-support` fork branch): 20b and 120b
+  run in bf16 on v7x. The head-to-head gpt-oss-120b benchmark vs vLLM `tpu-inference` is in
+  [`gptoss_120b_benchmark.md`](gptoss_120b_benchmark.md) (vLLM leads ~3.6–6.7× on throughput,
+  driven by v7x-tuned kernels + fp8 KV + DP=4). Not yet upstreamed, so gpt-oss still appears in
+  the "tpu-inference only" table above for stock SGLang-JAX `main`.
 - Sizes for the newest checkpoints (GLM-5, Qwen3.5, MiniMax-M2.5, Kimi-K2.6, MiMo-V2,
   Bailing-2.6, Grok-2) are approximate — verify against the model card before relying on them.

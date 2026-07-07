@@ -4,14 +4,18 @@ Status of bringing OpenAI **gpt-oss** (`gpt-oss-20b`, `gpt-oss-120b`) to SGLang-
 
 ## TL;DR
 
-- ✅ **gpt-oss-20b runs on TPU v7x (Ironwood) and produces correct output in `--dtype float32`.**
-  The full model path is implemented and validated: MXFP4 weight load, attention sinks,
-  alternating sliding/full attention, YaRN RoPE, QKV/O bias, and the clamped `swigluoai` MoE
-  with per-expert projection biases.
-- ⚠️ **bf16 serving currently NaNs** in the compiled forward (the eager forward and fp32 are
-  correct). This is the one open blocker — details below. **Serve with `--dtype float32` for now.**
-- ⏭️ `gpt-oss-120b` (v7x-8, `--tp-size 8`) and the head-to-head throughput benchmark vs
-  vLLM `tpu-inference` are gated on the bf16 fix (a fair bf16-vs-bf16/MXFP4 comparison).
+- ✅ **gpt-oss-20b and -120b run on TPU v7x (Ironwood) in `--dtype bfloat16`** and produce
+  correct output ("Paris", "4", "the quick brown fox … the lazy dog"). The full model path is
+  implemented and validated: MXFP4 weight load, attention sinks, alternating sliding/full
+  attention, YaRN RoPE, QKV/O bias, and the clamped `swigluoai` MoE with per-expert biases.
+- ✅ **bf16 NaN FIXED.** Root cause: the megablox **`gmm_v2`** grouped-matmul kernel returns
+  NaN in bf16 under the heavily-imbalanced group sizes that token padding creates (padding
+  tokens route to one expert). Fix: `force_gmm_v1` for gpt-oss (numerically correct v1 kernel).
+  Details below. fp32 also still works.
+- ✅ **gpt-oss-120b head-to-head vs vLLM `tpu-inference` on v7x-8** — see
+  [`gptoss_120b_benchmark.md`](gptoss_120b_benchmark.md). vLLM leads ~3.6–6.7× on throughput
+  (v7x-tuned `hd64` kernels + fp8 KV + DP=4 vs SGLang-JAX's untuned RPA + `gmm_v1` + bf16 KV);
+  the gap tracks kernel/config differences, not the model port.
 
 ## What was implemented (this session)
 
@@ -43,19 +47,20 @@ Key design points (all reuse existing primitives):
   `quant_method="mxfp4"` as unsupported → `quantization_config=None`, so EPMoE stays bf16 and we
   dequantize the experts ourselves.
 
-## How to run (fp32, single host)
+## How to run (bf16, single host)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --model-path openai/gpt-oss-20b \
   --trust-remote-code \
   --tp-size 8 --device tpu \
-  --dtype float32 \
+  --dtype bfloat16 \
   --host 0.0.0.0 --port 30000
 ```
 
 `--tp-size` = total JAX devices (v7x exposes 2 devices/chip, so a 4-chip v7x-8 host is `--tp-size 8`).
-`gpt-oss-120b` should run the identical path at fp32 on v7x-8 (fits in HBM).
+`gpt-oss-120b` runs the identical path (`--model-path openai/gpt-oss-120b`) on v7x-8 (fits in HBM).
+bf16 is now correct (see the bf16 fix below); fp32 also works via `--dtype float32`.
 
 ## Verification done
 
@@ -66,47 +71,50 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   - `"Q: What is 2+2?\nA:"` → `" 4"` (+ coherent Q&A)
   - `"The quick brown fox"` → `" jumps over the lazy dog."`
 
-## Known issue: bf16 → NaN (open)
+## bf16 → NaN — RESOLVED (megablox gmm_v2 kernel)
 
-In bf16 the server emits NaN logits (all `"!"`); **fp32 is correct**. The model math is fine —
-the NaN is specific to the **compiled/paged serving forward**:
+**Root cause:** the megablox **`gmm_v2`** grouped-matmul kernel returns NaN for gpt-oss's bf16
+experts when a padded (short) prompt routes **all its padding tokens to a single expert**,
+producing a heavily-imbalanced `group_sizes`. In serving, prompts are always padded up to a
+compile bucket, so this fires constantly. `gmm_v1` is numerically correct for the same inputs;
+full fp32 also masks it (its routing avoids the pathological grouping).
 
-- Full **fp32 24-layer server → coherent**.
-- **Offline eager forward** (real weights, bf16, even with token padding) → **finite** (2-layer
-  final amax ≈ 232, i.e. not even a massive-activation regime).
-- Server bf16: **1 layer fine, ≥2 layers NaN** (any layer type: 2×sliding, 2×full both NaN).
+**Fix:** `gmm(force_v1=...)` in `kernels/gmm/megablox_gmm_backend.py`, threaded through
+`EPMoE(force_gmm_v1=...)` in `layers/moe.py`; gpt-oss sets `force_gmm_v1=True` in
+`models/gpt_oss.py`. Verified: gpt-oss-20b **and** -120b bf16 on v7x-8 → coherent, no NaN;
+the 8 mxfp4 unit tests still pass.
 
-Ruled out (each a full recompile+test on v7x):
+**How it was localized** (the prior "instrumentation wall" was the *server's stale
+`JAX_COMPILATION_CACHE_DIR`*, not a real wall — in a fresh single-process run `jax.debug.print`
+works fine):
 
-- Attention — fp32 q/k/v **and** fp32 KV cache → still NaN.
-- MoE — forced EPMoE to fp32 → still NaN.
-- **fp32 activations + bf16 weights** (LinearBase outputs, MoE, KV, attention all fp32) →
-  **still NaN**, yet full fp32 works. Adding fp32 did **not** monotonically help, so the trigger
-  tracks the model **`dtype` flag itself** (a dtype-conditional *structural* path — e.g. KV-cache
-  packing bf16=2 vs fp32=1, or compilation bucketing — not any single op's precision).
-- Cross-layer XLA fusion (`optimization_barrier`), head_dim<128 padding, attention sinks,
-  `softmax_dtype=fp32`, padded-token masking in the MoE → none fixed it.
+- Built a fast single-process compiled-forward probe (`sgl_jax.dbg_forward` reusing
+  `bench_one_batch` helpers; `DBG_TOKEN_BUCKET=64` reproduces the padding trigger). 2-layer bf16
+  20b, 5-token prompt padded to a 64-bucket → NaN; unpadded → finite.
+- Per-layer probes: first NaN appears at **L0 MoE output** (`experts_out`) — attention is clean,
+  and the MoE inputs (router logits, top-k weights) are finite. Exactly the 5 real-token rows go
+  NaN.
+- A/B inside the MoE: fp32 gmm compute → still NaN; `zero_initialize=True` → still NaN; disable
+  expert bias → still NaN; **force `gmm_v1` → finite**. Full fp32 model → finite. So the bug is
+  the bf16 `gmm_v2` path under this group structure (Qwen3-MoE is unaffected — no expert bias /
+  no such padding stress in its tested paths).
 
-Localization is blocked by tooling: sglang's executor drops all host callbacks
-(`jax.debug.print`, `jax.pure_callback` with a keep-alive, file-write callbacks all silently
-DCE'd), `JAX_DEBUG_NANS=1` hangs (incompatible with the Pallas/compiled path), and Pallas requires
-jit so the server forward can't run eagerly. Note: vLLM `tpu-inference` ships a **dedicated
-`ragged_paged_attention_hd64` kernel** for gpt-oss rather than reusing the generic bf16 path —
-consistent with a bf16-specific compiled-path issue here.
-
-**Next lever:** reproduce the real `ModelRunner` compiled forward in a script and bisect by
-forcing fp32 per dtype-conditional structural choice (KV packing / bucketing), or get an
-sglang-jax maintainer / XLA HLO dump to find the unstable fused op.
+**Follow-up (out of scope):** a proper `gmm_v2` fix would let gpt-oss use the faster v2 kernel;
+until then `force_gmm_v1` is a documented throughput caveat (see the benchmark writeup).
 
 ## Roadmap / follow-ups
 
-1. **Fix bf16 serving** (compiled-path NaN) — unblocks the fair benchmark and 120b memory budget.
-2. **Head-to-head benchmark** vs vLLM `tpu-inference` on v7x, in the `qwen3_benchmark.md` format
-   (unified `sgl_jax.bench_serving` client, concurrency sweep, TTFT/ITL/throughput).
-3. **gpt-oss-120b** on v7x-8 (`--tp-size 8`) — same code path, first throughput point.
-4. **Native MXFP4 grouped-matmul** (keep experts 4-bit) for HBM/throughput.
-5. **v7x-tuned RPA/gmm block sizes** for gpt-oss shapes (avoid the `LOOKUP MISS` heuristic).
-6. **EPLB / expert-parallel tuning** for 128 experts (120b).
+1. ✅ **Fix bf16 serving** (compiled-path NaN) — done (`force_gmm_v1`; see above).
+2. ✅ **Head-to-head benchmark** vs vLLM `tpu-inference` on v7x — done, see
+   [`gptoss_120b_benchmark.md`](gptoss_120b_benchmark.md).
+3. ✅ **gpt-oss-120b** on v7x-8 (`--tp-size 8`) — done, bf16, coherent + benchmarked.
+4. **Fix megablox `gmm_v2` bf16** for imbalanced group_sizes → drop `force_gmm_v1` and recover
+   MoE throughput.
+5. **v7x-tuned RPA/gmm block sizes** for gpt-oss shapes (avoid the `LOOKUP MISS` heuristic) and a
+   dedicated `head_dim=64` attention path (vLLM ships `ragged_paged_attention_hd64`).
+6. **Native MXFP4 grouped-matmul** (keep experts 4-bit) for HBM/throughput.
+7. **fp8 KV cache** for gpt-oss (vLLM uses it; halves KV bandwidth/footprint).
+8. **EPLB / expert-parallel tuning** for 128 experts (120b).
 
 See `sglang_jax_vs_tpu_inference.md` (same dir) for the model-coverage matrix and the benchmark
 methodology reference.
