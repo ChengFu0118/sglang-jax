@@ -28,6 +28,7 @@ def gmm(
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
+    force_v1: bool = False,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -57,12 +58,19 @@ def gmm(
             output afterwards.
         v2_tile_info: Optional TileSizes or TileFn for v2 kernel tiling.
             Defaults to calculate_tiling (auto-tiler) when None.
+        force_v1: Force the v1 kernel even when v2 is otherwise supported. The
+            v2 kernel produces NaNs for gpt-oss's bf16 grouped matmul under the
+            heavily-imbalanced group sizes that padded (short) prompts create
+            (all padded tokens route to one expert); v1 is numerically correct
+            for the same inputs. See EPMoE(force_gmm_v1=...).
     """
     if interpret is None:
         interpret = not is_tpu_runtime()
 
-    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
-        rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    use_gmm_v2 = (
+        not interpret
+        and not force_v1
+        and is_supported_by_gmm_v2(rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs)
     )
 
     # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles

@@ -59,6 +59,7 @@ class EPMoE(nnx.Module):
         use_expert_bias: bool = False,
         swiglu_limit: float | None = None,
         swiglu_alpha: float = 1.702,
+        force_gmm_v1: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -68,6 +69,11 @@ class EPMoE(nnx.Module):
         self.use_expert_bias = use_expert_bias
         self.swiglu_limit = swiglu_limit
         self.swiglu_alpha = swiglu_alpha
+        # Force the megablox v1 grouped-matmul kernel. The v2 kernel returns
+        # NaNs for gpt-oss's bf16 experts when a padded (short) prompt routes
+        # all its padding tokens to a single expert, producing a heavily
+        # imbalanced group_sizes; v1 is numerically correct for the same inputs.
+        self.force_gmm_v1 = force_gmm_v1
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -682,6 +688,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             maybe_quantize_lhs=act_q_dtype is not None,
             acc_dtype=jnp.float32,
+            force_v1=self.force_gmm_v1,
         )
 
         # === GEMM1: x @ w0 and x @ w1 ===

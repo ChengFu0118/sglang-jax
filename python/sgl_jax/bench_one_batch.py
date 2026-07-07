@@ -150,6 +150,7 @@ def load_model(server_args, port_args, tp_rank):
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         tp_size=tp,
+        dp_size=1,
         server_args=server_args,
         mesh=mesh,
     )
@@ -243,10 +244,28 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, custom_inpu
 
 
 def extend(reqs, model_runner):
-    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
-    dummy_tree_cache = SimpleNamespace(
-        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-    )
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation).
+    # SWA models use SWATokenToKVPoolAllocator, which requires a ChunkCache /
+    # SWAChunkCache (mirrors the server's --disable-radix-cache path).
+    from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+    from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+
+    alloc = model_runner.token_to_kv_pool_allocator
+    if isinstance(alloc, SWATokenToKVPoolAllocator):
+        dummy_tree_cache = SWAChunkCache(
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=alloc,
+            page_size=model_runner.page_size,
+            sliding_window_size=getattr(
+                model_runner.model_config.hf_config, "sliding_window", 0
+            ),
+        )
+    else:
+        dummy_tree_cache = ChunkCache(
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=alloc,
+            page_size=model_runner.page_size,
+        )
     # For benchmark, put all reqs in DP rank 0 (single DP)
     reqs_per_dp = [reqs]
 
@@ -302,9 +321,21 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
             ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size) * page_size
         )
     )
+    # The scheduler normally sizes this persistent host scratch buffer to the
+    # largest precompile bucket; offline we grow it on demand (np.zeros).
+    model_runner.req_to_token_pool.init_cache_loc_host_buffer(cache_loc_needed)
+
+    # Debug knob: pad the extend token dimension up to a bucket (mirrors the
+    # server, which pads short prompts up to a precompile bucket -> padding
+    # tokens with loc=-1). Set DBG_TOKEN_BUCKET to reproduce padding-triggered
+    # numerics. Only applies to extend (decode token dim == batch size).
+    token_paddings = [token_first_arg]
+    _dbg_bucket = os.environ.get("DBG_TOKEN_BUCKET")
+    if _dbg_bucket and not batch.forward_mode.is_decode_or_idle():
+        token_paddings = [max(int(_dbg_bucket), token_first_arg)]
 
     model_worker_batch = batch.get_model_worker_batch(
-        [token_first_arg],
+        token_paddings,
         [bs_needed],
         [cache_loc_needed],
         page_size,
@@ -319,7 +350,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     logits_metadata = LogitsMetadata.from_model_worker_batch(
         model_worker_batch, mesh=model_runner.mesh
     )
-    logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
+    logits_output, _, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
 
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(

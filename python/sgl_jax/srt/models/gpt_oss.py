@@ -249,6 +249,11 @@ class GptOssMoE(nnx.Module):
             use_expert_bias=True,
             swiglu_limit=getattr(config, "swiglu_limit", 7.0),
             swiglu_alpha=1.702,
+            # The megablox v2 grouped-matmul kernel emits NaNs in bf16 when a
+            # padded (short) prompt routes all its padding tokens to one expert
+            # (extremely imbalanced group_sizes). This is *the* gpt-oss bf16
+            # serving NaN. v1 is numerically correct for the same inputs.
+            force_gmm_v1=True,
         )
 
     def __call__(
