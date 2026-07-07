@@ -353,6 +353,8 @@ class ModelRunnerKVCacheMixin:
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
+        elif self.server_args.kv_cache_dtype in ("fp32", "float32"):
+            self.kv_cache_dtype = jnp.float32
         else:
             raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)

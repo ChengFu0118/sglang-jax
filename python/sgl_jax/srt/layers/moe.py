@@ -24,6 +24,22 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
+def _swigluoai(
+    gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
+) -> jax.Array:
+    """Clamped SwiGLU used by gpt-oss.
+
+    Mirrors ``kernels/fused_moe/v2/kernel.py:swigluoai`` exactly: clip the gate
+    single-sided and the up branch double-sided, gate through ``sigmoid(alpha *
+    gate)``, then multiply by ``(up + 1)`` (note the ``+1`` — gpt-oss adds one
+    to the linear branch, unlike vanilla SwiGLU).
+    """
+    gate = jnp.clip(gate, a_max=limit)
+    up = jnp.clip(up, a_min=-limit, a_max=limit)
+    glu = gate * jax.nn.sigmoid(alpha * gate)
+    return (up + 1.0) * glu
+
+
 class EPMoE(nnx.Module):
     def __init__(
         self,
@@ -40,10 +56,18 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
+        use_expert_bias: bool = False,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float = 1.702,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
+        # gpt-oss: per-expert projection biases + clamped SwiGLU. Gated so other
+        # models (which pass neither) are bit-for-bit unaffected.
+        self.use_expert_bias = use_expert_bias
+        self.swiglu_limit = swiglu_limit
+        self.swiglu_alpha = swiglu_alpha
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -126,6 +150,36 @@ class EPMoE(nnx.Module):
             self.wi_0_scale = None
             self.wi_1_scale = None
             self.wo_scale = None
+
+            # Per-expert projection biases (gpt-oss). Shapes follow the gmm
+            # rhs_bias contract [num_groups, 1, out_dim]: GEMM1 outputs the
+            # intermediate dim (sharded on "tensor"), GEMM2 outputs hidden.
+            if self.use_expert_bias:
+                self.w0_kernel_bias = nnx.Param(
+                    jnp.zeros(
+                        (self.num_experts, 1, intermediate_dim),
+                        dtype=weight_dtype,
+                        out_sharding=P("expert", None, "tensor"),
+                    )
+                )
+                self.w1_kernel_bias = nnx.Param(
+                    jnp.zeros(
+                        (self.num_experts, 1, intermediate_dim),
+                        dtype=weight_dtype,
+                        out_sharding=P("expert", None, "tensor"),
+                    )
+                )
+                self.wo_kernel_bias = nnx.Param(
+                    jnp.zeros(
+                        (self.num_experts, 1, hidden_size),
+                        dtype=weight_dtype,
+                        out_sharding=P("expert", None, None),
+                    )
+                )
+            else:
+                self.w0_kernel_bias = None
+                self.w1_kernel_bias = None
+                self.wo_kernel_bias = None
 
     def _detect_device_capabilities(self):
         try:
@@ -455,6 +509,18 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
+            # Expert projection biases. gate/up biases live on the "tensor"-
+            # sharded output dim (intermediate) and are added once per shard —
+            # correct. The wo (down-proj) output, however, is reduced across the
+            # "tensor" axis (psum) in _forward, and gmm adds rhs_bias on every
+            # shard, so the wo bias would be counted tp_size times. Pre-scale it
+            # by 1/tp_size so the post-reduction contribution is exactly 1x.
+            w0_bias = self.w0_kernel_bias.value if self.w0_kernel_bias is not None else None
+            w1_bias = self.w1_kernel_bias.value if self.w1_kernel_bias is not None else None
+            wo_bias = self.wo_kernel_bias.value if self.wo_kernel_bias is not None else None
+            if wo_bias is not None and self.tp_size > 1:
+                wo_bias = wo_bias / self.tp_size
+
             result = shard_map(
                 partial(self._forward, scatter_on_tensor=scatter_on_tensor),
                 mesh=self.moe_mesh,
@@ -487,9 +553,9 @@ class EPMoE(nnx.Module):
                 w0_scale,
                 w1_scale,
                 wo_scale,
-                None,
-                None,
-                None,
+                w0_bias,
+                w1_bias,
+                wo_bias,
             )
 
         # The shard_map ran under updated_mesh (expert, tensor); land back on
@@ -639,13 +705,21 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+        if self.activation == "swigluoai":
+            # gpt-oss: clamped SwiGLU with (up + 1). Fuses gate+up in one call
+            # rather than the silu/gelu-then-multiply path below.
+            swiglu_limit = self.swiglu_limit if self.swiglu_limit is not None else 7.0
+            intermediate_layer = _swigluoai(
+                layer_w0, layer_w1, alpha=self.swiglu_alpha, limit=swiglu_limit
+            )
         else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+            if self.activation == "silu":
+                layer_act = jax.nn.silu(layer_w0)
+            elif self.activation == "gelu":
+                layer_act = jax.nn.gelu(layer_w0)
+            else:
+                raise ValueError(f"Unsupported activation function {self.activation}")
+            intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(
