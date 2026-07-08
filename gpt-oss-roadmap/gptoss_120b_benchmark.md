@@ -27,7 +27,7 @@ docs/recipes recommend on this host. This is documented, not hidden.
 | | SGLang-JAX | vLLM tpu-inference |
 |---|---|---|
 | Parallelism | **TP=8** (single replica) | **TP=2 × DP=4** (4 replicas) |
-| Weights | bf16 (MXFP4 dequantized at load) | bf16 (MXFP4) |
+| Weights | **bf16** experts (MXFP4 dequantized at load) | **MXFP4 4-bit** experts (`w4a16`, kept 4-bit) |
 | KV cache | **bf16** | **fp8** |
 | Attention kernel | generic RPA v3, **head_dim 64 padded to 128, untuned block sizes on v7x** | dedicated **`ragged_paged_attention_hd64`, v7x-tuned block sizes** |
 | MoE grouped matmul | megablox **gmm_v1** (v2 NaNs in bf16 — see roadmap) | tuned GMM TP kernel |
@@ -104,7 +104,13 @@ established. All requests in the reported points completed (`completed = 3 × co
   3. **KV dtype** — vLLM's fp8 KV halves KV bandwidth/footprint vs SGLang-JAX's bf16 KV.
   4. **DP=4 vs TP=8** — 4 independent replicas batch more efficiently at this scale than a
      single 8-way tensor-parallel replica with more cross-device collectives.
-  5. Native MXFP4 matmul (keep experts 4-bit) — neither dequant-to-bf16 cost is optimized here.
+  5. Native MXFP4 matmul (keep experts 4-bit) — **vLLM keeps experts MXFP4 (4-bit); SGLang-JAX
+     dequantizes to bf16 (4× the expert bytes)**. So this is *not* a bf16-vs-bf16 comparison.
+
+For the full profile-backed root-cause analysis (the #1 bottleneck is a per-step expert-weight
+relayout copy, ~35% of decode time — not the MoE/attention kernels), the 4× KV breakdown, the
+Qwen3-MoE control, and the ranked fix roadmap, see
+[`gptoss_120b_bottleneck_analysis.md`](gptoss_120b_bottleneck_analysis.md).
 
 ### vLLM baseline sanity
 

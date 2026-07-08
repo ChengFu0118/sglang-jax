@@ -14,8 +14,13 @@ Status of bringing OpenAI **gpt-oss** (`gpt-oss-20b`, `gpt-oss-120b`) to SGLang-
   Details below. fp32 also still works.
 - ✅ **gpt-oss-120b head-to-head vs vLLM `tpu-inference` on v7x-8** — see
   [`gptoss_120b_benchmark.md`](gptoss_120b_benchmark.md). vLLM leads ~3.6–6.7× on throughput
-  (v7x-tuned `hd64` kernels + fp8 KV + DP=4 vs SGLang-JAX's untuned RPA + `gmm_v1` + bf16 KV);
-  the gap tracks kernel/config differences, not the model port.
+  (v7x-tuned `hd64` kernels + fp8 KV + DP=4 + MXFP4 4-bit experts vs SGLang-JAX's untuned RPA +
+  `gmm_v1` + bf16 KV + bf16 experts); the gap tracks kernel/config differences, not the model port.
+- 🔬 **Profile-backed bottleneck analysis** — see
+  [`gptoss_120b_bottleneck_analysis.md`](gptoss_120b_bottleneck_analysis.md). The #1 fixable
+  bottleneck is a per-step **expert-weight relayout copy (~35% of decode time)**; then the 4× KV
+  (head_dim pad + bf16-vs-fp8) and the TP=8 collective tax. Includes a Qwen3-MoE control proving
+  SGLang-JAX's MoE path is healthy, and a ranked fix roadmap.
 
 ## What was implemented (this session)
 

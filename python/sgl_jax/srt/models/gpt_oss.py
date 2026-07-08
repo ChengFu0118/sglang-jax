@@ -444,6 +444,24 @@ class GptOssForCausalLM(nnx.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, model_config: ModelConfig):
+        # Dummy mode (--load-format dummy): allocate zero-initialized, correctly
+        # sharded params on-device without reading any files. Used for latency /
+        # shape profiling (e.g. head_dim=128 "head-stitch" ablation) — output is
+        # meaningless but kernel/compile latency is representative.
+        self._dummy = getattr(model_config, "_dummy_mode", False)
+        if self._dummy:
+            def _noget(name):
+                return None
+
+            self._assign(self.model.embed_tokens.embedding, None, ("tensor", None))
+            self._assign(self.model.norm.scale, None, (None,))
+            if not getattr(self.config, "tie_word_embeddings", False):
+                self._assign(self.lm_head.embedding, None, ("tensor", None))
+            for i in range(self.config.num_hidden_layers):
+                self._load_layer(i, _noget)
+            logger.info("GPT-OSS dummy (zero) weights initialized!")
+            return
+
         self._st_handles: dict[str, safe_open] = {}
         key_to_file: dict[str, str] = {}
         model_path = model_config.model_path
@@ -509,10 +527,21 @@ class GptOssForCausalLM(nnx.Module):
         """
         import ml_dtypes
 
+        target = param.value  # abstract ShapeDtypeStruct from eval_shape
+        sharding = NamedSharding(mesh or self.mesh, P(*spec))
+        if host_array is None:
+            # Dummy mode: on-device zero alloc, no host materialization.
+            tshape = tuple(target.shape)
+            tdtype = jnp.dtype(target.dtype)
+            with (mesh or self.mesh):
+                param.value = jax.jit(
+                    lambda: jnp.zeros(tshape, tdtype), out_shardings=sharding
+                )()
+            return
+
         arr = np.asarray(host_array)
         if transpose:
             arr = arr.T
-        target = param.value  # abstract ShapeDtypeStruct from eval_shape
         if tuple(arr.shape) != tuple(target.shape):
             raise ValueError(
                 f"shape mismatch assigning weight: got {arr.shape}, expected {target.shape}"
@@ -520,7 +549,6 @@ class GptOssForCausalLM(nnx.Module):
         target_dtype = jnp.dtype(target.dtype)
         np_dtype = ml_dtypes.bfloat16 if target_dtype == jnp.bfloat16 else np.dtype(target_dtype)
         arr = arr.astype(np_dtype)
-        sharding = NamedSharding(mesh or self.mesh, P(*spec))
         param.value = jax.make_array_from_callback(arr.shape, sharding, lambda idx: arr[idx])
 
     def _load_layer(self, i: int, get):
@@ -550,7 +578,8 @@ class GptOssForCausalLM(nnx.Module):
         self._assign(attn.o_proj.bias, get(f"{sa}.o_proj.bias"), (None,))
 
         # Attention sinks (per-head, sharded on "tensor"; upcast to f32).
-        self._assign(attn.sinks, get(f"{sa}.sinks").astype(np.float32), ("tensor",))
+        _sinks = None if self._dummy else get(f"{sa}.sinks").astype(np.float32)
+        self._assign(attn.sinks, _sinks, ("tensor",))
 
         # Router (GateLogit kernel is [hidden, experts] → transpose HF [experts, hidden]).
         self._assign(
@@ -567,6 +596,16 @@ class GptOssForCausalLM(nnx.Module):
 
     def _load_experts(self, prefix: str, experts: EPMoE, get):
         eprefix = f"{prefix}.mlp.experts"
+
+        if getattr(self, "_dummy", False):
+            mm = experts.moe_mesh
+            self._assign(experts.wi_0, None, ("expert", None, "tensor"), mesh=mm)
+            self._assign(experts.wi_1, None, ("expert", None, "tensor"), mesh=mm)
+            self._assign(experts.wo, None, ("expert", "tensor", None), mesh=mm)
+            self._assign(experts.w0_kernel_bias, None, ("expert", None, "tensor"), mesh=mm)
+            self._assign(experts.w1_kernel_bias, None, ("expert", None, "tensor"), mesh=mm)
+            self._assign(experts.wo_kernel_bias, None, ("expert", None, None), mesh=mm)
+            return
 
         # gate_up_proj: MXFP4 [E, 2*inter, hidden] (out, in). Dequant then split
         # gate=even / up=odd rows along the (2*inter) output axis.
