@@ -2120,6 +2120,46 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("m", None, "bfloat16", "bfloat16", 64, 32, 128, 256, 128): (32, 256, 32, 256),
         ("m", None, "bfloat16", "bfloat16", 64, 32, 128, 256, 512): (32, 512, 32, 512),
         ("m", None, "bfloat16", "bfloat16", 64, 32, 128, 256, 2048): (32, 512, 32, 512),
+        # ---- gpt-oss-120b (q=64,kv=8,hd=64->128,page=128) @ TP=8 -> per-shard
+        # q_heads=8, kv_heads=1. Alternating SWA(sliding_window=128)/full layers.
+        # Measured on v7x-8 by benchmark/.../rpa_d2_microbench.py (block sizes only
+        # change tiling; output is fp-identical to the heuristic). Wins vs the
+        # get_default_block_sizes heuristic that these entries replace:
+        #   decode SWA  : bkv 128->256          ~1.11x  (kv~8k)
+        #   mixed SWA   : bkv 1152/2048->384    ~1.20-1.52x (window=128 => skip
+        #                 loading masked-out KV; 384=3*page is the sweet spot)
+        #   mixed full  : bkv 1024/1152->2048   ~1.10x (<=2k tokens)
+        #   mixed full  : bkv 2048->4096        ~1.07x (>=4k tokens)
+        # ('d', None, ...) is intentionally omitted: the heuristic already picks
+        # bkv=full_kv there, which is optimal (a fixed table bkv would regress it).
+        # Decode SWA (sliding_window=128): larger bkv than window helps pipelining.
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 1): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 64): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 128): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 256): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 512): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 1024): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 2048): (1, 256, 1, 256),
+        # Mixed / prefill SWA (sliding_window=128): tiny bkv=384 (3 pages) wins.
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 1): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 64): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 128): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 256): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 512): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 1024): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 2048): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 4096): (32, 384, 32, 384),
+        ("m", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 8192): (32, 384, 32, 384),
+        # Mixed / prefill full-attn: bkv scales with the token bucket.
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 1): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 64): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 128): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 256): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 512): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 1024): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 2048): (32, 2048, 32, 1024),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 4096): (32, 4096, 32, 2048),
+        ("m", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 8192): (32, 4096, 32, 2048),
     },
 }
 

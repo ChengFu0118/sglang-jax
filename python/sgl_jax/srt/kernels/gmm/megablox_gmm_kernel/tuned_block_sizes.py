@@ -30,6 +30,24 @@ logger = logging.getLogger(__name__)
 #   - tk: int, k-dimension tile size
 #   - tn: int, n-dimension tile size
 TUNED_BLOCK_SIZES = {
+    # --- gpt-oss-120b v7x (bf16 experts, TP=8, force_gmm_v1) ---
+    # Down-projection (wo): k=intermediate/TP8=360, n=hidden=2880, all 128
+    # experts on each shard. The default tn=2048 splits n=2880 into 2 n-tiles
+    # (2048 + 832 remainder); using the full n as a single n-tile (tn=2880) is
+    # ~1.16-1.21x faster and fp-identical (D3 microbench, v7x-8). tk=k=360 so
+    # gmm.py's `tk % quant_block_size` override is a no-op and keeps this value.
+    # The gate/up (wi) shapes (k=2880,n=360) were already optimal at the default
+    # tn=384 (n=360 padded), so no tuned entry is added for them.
+    (262144, 360, 2880, 128, 128, "bfloat16", "bfloat16", 360): (
+        512,
+        360,
+        2880,
+    ),
+    (256, 360, 2880, 128, 128, "bfloat16", "bfloat16", 360): (
+        128,
+        360,
+        2880,
+    ),
     (128, 2560, 5120, 160, 20, "bfloat16", "float8_e4m3fn", 2560): (
         128,
         256 * 10,

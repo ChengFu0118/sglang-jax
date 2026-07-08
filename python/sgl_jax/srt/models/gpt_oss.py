@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.experimental.layout import Format, Layout
+from jax.experimental.layout import Format, Layout, with_layout_constraint
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -275,6 +275,21 @@ class GptOssMoE(nnx.Module):
         )
         if token_valid_mask is not None:
             hidden_states = jnp.where(token_valid_mask[:, None], hidden_states, 0.0)
+
+        # D5: the EPMoE grouped-matmul (Pallas gmm) LHS [tokens, hidden] is
+        # pinned row-major ({1,0}, hidden contiguous), but the residual/norm
+        # stream XLA picks is {0,1} (token contiguous). Without a hint, every
+        # MoE layer pays a round-trip transpose ({0,1}->{1,0} into the gmm,
+        # {1,0}->{0,1} back out). Constraining the MoE input to {1,0} lets XLA
+        # emit the RMSNorm output row-major and fold the transpose away.
+        # Measured on gpt-oss-120b v7x bs64/in1024 (bench_one_batch profile):
+        # memory/layout copies -277.8ms, collectives +81.0ms, net device
+        # time -187.0ms (-1.6%); fp-identical (test_mxfp4_gpt_oss 8/8).
+        if hidden_states.ndim == 2:
+            hidden_states = with_layout_constraint(
+                hidden_states,
+                Layout(major_to_minor=(0, 1)),
+            )
 
         router_logits = self.moe_gate(hidden_states)  # raw logits, f32
         router_logits = router_logits + self.moe_gate.bias.value.astype(router_logits.dtype)
