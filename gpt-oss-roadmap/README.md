@@ -21,6 +21,16 @@ Status of bringing OpenAI **gpt-oss** (`gpt-oss-20b`, `gpt-oss-120b`) to SGLang-
   bottleneck is a per-step **expert-weight relayout copy (~35% of decode time)**; then the 4× KV
   (head_dim pad + bf16-vs-fp8) and the TP=8 collective tax. Includes a Qwen3-MoE control proving
   SGLang-JAX's MoE path is healthy, and a ranked fix roadmap.
+- ✅ **Fix #1 (expert row-major layout) DONE + verified** — see
+  [`gptoss_120b_fix1_layout.md`](gptoss_120b_fix1_layout.md) (+ `gptoss_120b_fix1_profile.csv`,
+  `gptoss_120b_fix1_throughput.csv`). Pinning the gmm expert weights to the `{2,1,0}` layout the
+  kernel tiles for eliminates the per-step relayout copy: memory/layout device time **36.1% →
+  13.1%**, total decode device time **−25.6%**, **decode 1183 → 4045 tok/s (3.4×)** at bs64, bf16.
+  Numerics unchanged (Paris/4/lazy dog; 8/8 unit tests). Commit `52a818df`.
+- 📊 **Post-Fix#1 serving sweep** (qwen3_benchmark format) — see
+  [`gptoss_120b_sweep.md`](gptoss_120b_sweep.md) (+ `gptoss_120b_fix1_sweep.csv`). ISL/OSL × batch
+  scan of gpt-oss-120b bf16 on v7x-8. Vs the pre-fix run at ISL8192/OSL1024: ITL **4.5× lower**
+  (49→11 ms) and output tput **4.7×** (216→1026 tok/s) at c=16.
 
 ## What was implemented (this session)
 
@@ -113,13 +123,15 @@ until then `force_gmm_v1` is a documented throughput caveat (see the benchmark w
 2. ✅ **Head-to-head benchmark** vs vLLM `tpu-inference` on v7x — done, see
    [`gptoss_120b_benchmark.md`](gptoss_120b_benchmark.md).
 3. ✅ **gpt-oss-120b** on v7x-8 (`--tp-size 8`) — done, bf16, coherent + benchmarked.
-4. **Fix megablox `gmm_v2` bf16** for imbalanced group_sizes → drop `force_gmm_v1` and recover
+4. ✅ **Fix #1: expert-weight row-major layout** (kill per-step relayout copy) — done + verified,
+   **3.4× decode** at bs64; see [`gptoss_120b_fix1_layout.md`](gptoss_120b_fix1_layout.md).
+5. **Fix megablox `gmm_v2` bf16** for imbalanced group_sizes → drop `force_gmm_v1` and recover
    MoE throughput.
-5. **v7x-tuned RPA/gmm block sizes** for gpt-oss shapes (avoid the `LOOKUP MISS` heuristic) and a
+6. **v7x-tuned RPA/gmm block sizes** for gpt-oss shapes (avoid the `LOOKUP MISS` heuristic) and a
    dedicated `head_dim=64` attention path (vLLM ships `ragged_paged_attention_hd64`).
-6. **Native MXFP4 grouped-matmul** (keep experts 4-bit) for HBM/throughput.
-7. **fp8 KV cache** for gpt-oss (vLLM uses it; halves KV bandwidth/footprint).
-8. **EPLB / expert-parallel tuning** for 128 experts (120b).
+7. **Native MXFP4 grouped-matmul** (keep experts 4-bit) for HBM/throughput.
+8. **fp8 KV cache** for gpt-oss (vLLM uses it; halves KV bandwidth/footprint).
+9. **EPLB / expert-parallel tuning** for 128 experts (120b).
 
 See `sglang_jax_vs_tpu_inference.md` (same dir) for the model-coverage matrix and the benchmark
 methodology reference.
