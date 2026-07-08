@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental.layout import Format, Layout
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -517,6 +518,7 @@ class GptOssForCausalLM(nnx.Module):
         *,
         mesh: jax.sharding.Mesh | None = None,
         transpose: bool = False,
+        row_major: bool = False,
     ):
         """Assign a host array into an nnx param with an explicit sharding.
 
@@ -524,18 +526,31 @@ class GptOssForCausalLM(nnx.Module):
         ``make_array_from_callback`` can't use, so we build a concrete
         ``NamedSharding`` from ``spec`` on ``mesh`` (the model mesh by default,
         or an EPMoE ``moe_mesh`` for expert tensors).
+
+        With ``row_major=True`` the on-device array is pinned to the standard
+        row-major layout (last dim contiguous == XLA ``{n-1,...,1,0}``) via a
+        ``Format``. The megablox gmm kernel tiles its ``rhs [E,k,n]`` with ``n``
+        as the lane/contiguous dim, so storing the (static) expert weights in
+        that layout up front avoids XLA relaying them out on *every* forward
+        step. Layout is physical byte order only — values are unchanged. A
+        ``Format`` is accepted wherever a ``Sharding`` is in jax 0.8.1
+        (``make_array_from_callback`` / jit ``out_shardings``).
         """
         import ml_dtypes
 
         target = param.value  # abstract ShapeDtypeStruct from eval_shape
         sharding = NamedSharding(mesh or self.mesh, P(*spec))
+        placement = sharding
+        if row_major:
+            layout = Layout(major_to_minor=tuple(range(len(target.shape))))
+            placement = Format(layout, sharding)
         if host_array is None:
             # Dummy mode: on-device zero alloc, no host materialization.
             tshape = tuple(target.shape)
             tdtype = jnp.dtype(target.dtype)
             with (mesh or self.mesh):
                 param.value = jax.jit(
-                    lambda: jnp.zeros(tshape, tdtype), out_shardings=sharding
+                    lambda: jnp.zeros(tshape, tdtype), out_shardings=placement
                 )()
             return
 
@@ -549,7 +564,7 @@ class GptOssForCausalLM(nnx.Module):
         target_dtype = jnp.dtype(target.dtype)
         np_dtype = ml_dtypes.bfloat16 if target_dtype == jnp.bfloat16 else np.dtype(target_dtype)
         arr = arr.astype(np_dtype)
-        param.value = jax.make_array_from_callback(arr.shape, sharding, lambda idx: arr[idx])
+        param.value = jax.make_array_from_callback(arr.shape, placement, lambda idx: arr[idx])
 
     def _load_layer(self, i: int, get):
         prefix = f"model.layers.{i}"
@@ -599,9 +614,9 @@ class GptOssForCausalLM(nnx.Module):
 
         if getattr(self, "_dummy", False):
             mm = experts.moe_mesh
-            self._assign(experts.wi_0, None, ("expert", None, "tensor"), mesh=mm)
-            self._assign(experts.wi_1, None, ("expert", None, "tensor"), mesh=mm)
-            self._assign(experts.wo, None, ("expert", "tensor", None), mesh=mm)
+            self._assign(experts.wi_0, None, ("expert", None, "tensor"), mesh=mm, row_major=True)
+            self._assign(experts.wi_1, None, ("expert", None, "tensor"), mesh=mm, row_major=True)
+            self._assign(experts.wo, None, ("expert", "tensor", None), mesh=mm, row_major=True)
             self._assign(experts.w0_kernel_bias, None, ("expert", None, "tensor"), mesh=mm)
             self._assign(experts.w1_kernel_bias, None, ("expert", None, "tensor"), mesh=mm)
             self._assign(experts.wo_kernel_bias, None, ("expert", None, None), mesh=mm)
@@ -627,9 +642,9 @@ class GptOssForCausalLM(nnx.Module):
         del down
 
         mm = experts.moe_mesh
-        self._assign(experts.wi_0, wi_0, ("expert", None, "tensor"), mesh=mm)
-        self._assign(experts.wi_1, wi_1, ("expert", None, "tensor"), mesh=mm)
-        self._assign(experts.wo, wo, ("expert", "tensor", None), mesh=mm)
+        self._assign(experts.wi_0, wi_0, ("expert", None, "tensor"), mesh=mm, row_major=True)
+        self._assign(experts.wi_1, wi_1, ("expert", None, "tensor"), mesh=mm, row_major=True)
+        self._assign(experts.wo, wo, ("expert", "tensor", None), mesh=mm, row_major=True)
 
         # Biases: gate_up_proj_bias [E, 2*inter] split even/odd → [E, 1, inter];
         # down_proj_bias [E, hidden] → [E, 1, hidden]. Matches gmm rhs_bias
