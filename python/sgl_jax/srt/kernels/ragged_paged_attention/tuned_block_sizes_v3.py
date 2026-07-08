@@ -2133,7 +2133,18 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         # ('d', None, ...) is intentionally omitted: the heuristic already picks
         # bkv=full_kv there, which is optimal (a fixed table bkv would regress it).
         # Decode SWA (sliding_window=128): larger bkv than window helps pipelining.
+        # D10: extend to the small decode-batch buckets {2,4,8,16,32} that arise at
+        # low concurrency / ramp-up. Without them the ('d',128,...,8,1,128,128,N)
+        # lookup missed for N in {2,4,8,16,32} -> heuristic -> a one-time mid-run XLA
+        # compile that stalled 8k decode throughput (fresh-cache artifact). bq=1
+        # (q-len 1); bkv=256 (=2*window, page-aligned) matches every tuned neighbor
+        # bs=1..2048, so fp-identical, tiling-only.
         ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 1): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 2): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 4): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 8): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 16): (1, 256, 1, 256),
+        ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 32): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 64): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 128): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 8, 1, 128, 128, 256): (1, 256, 1, 256),
