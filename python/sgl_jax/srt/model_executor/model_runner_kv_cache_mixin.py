@@ -355,6 +355,15 @@ class ModelRunnerKVCacheMixin:
             self.kv_cache_dtype = jnp.bfloat16
         elif self.server_args.kv_cache_dtype in ("fp32", "float32"):
             self.kv_cache_dtype = jnp.float32
+        elif self.server_args.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            # fp8 KV cache: stored as e4m3 (higher precision, range +-448).
+            # K/V are quantized on write and read back straight into the RPA v3
+            # MXU matmul (bf16-Q x fp8-KV, f32 accumulate). See flashattention_backend.
+            self.kv_cache_dtype = jnp.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+            # fp8 KV cache: stored as e5m2 (wider range +-57344, fewer mantissa
+            # bits). Safer for models with massive activation outliers (gpt-oss).
+            self.kv_cache_dtype = jnp.float8_e5m2
         else:
             raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)

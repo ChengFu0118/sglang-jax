@@ -524,6 +524,23 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
+        # fp8 KV cache: when the pool buffer is fp8 (e4m3/e5m2), quantize the new
+        # K/V to fp8 before the kernel (the RPA v3 in-kernel DMA write requires
+        # keys.dtype == values.dtype == kv_cache.dtype) and fold the static
+        # per-tensor scales into the kernel (k_scale into the softmax scale,
+        # v_scale into the PV output). K/V are read straight into the MXU as fp8.
+        kv_is_fp8 = jnp.issubdtype(kv_cache_fused.dtype, jnp.floating) and (
+            jnp.dtype(kv_cache_fused.dtype).itemsize == 1
+        )
+        if kv_is_fp8:
+            fp8_dtype = kv_cache_fused.dtype
+            k_scale = float(getattr(layer, "k_scale", 1.0) or 1.0)
+            v_scale = float(getattr(layer, "v_scale", 1.0) or 1.0)
+        else:
+            fp8_dtype = None
+            k_scale = None
+            v_scale = None
+
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
@@ -572,6 +589,15 @@ class FlashAttention(AttentionBackend):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
 
+            # fp8 KV: quantize new K/V to the cache dtype inside the shard_map so
+            # the per-device tensors match the (sharded) fp8 cache. Static
+            # per-tensor quant: clip(x / scale) then cast to fp8. Q stays bf16.
+            if fp8_dtype is not None:
+                finfo = jnp.finfo(fp8_dtype)
+                lo, hi = float(finfo.min), float(finfo.max)
+                keys = jnp.clip(keys.astype(jnp.float32) / k_scale, lo, hi).astype(fp8_dtype)
+                values = jnp.clip(values.astype(jnp.float32) / v_scale, lo, hi).astype(fp8_dtype)
+
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
                 queries,
@@ -583,6 +609,8 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),

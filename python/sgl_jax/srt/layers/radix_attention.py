@@ -38,6 +38,8 @@ class RadixAttention(nnx.Module):
         logit_cap: float = 0,
         attn_type: AttentionType = AttentionType.DECODER,
         softmax_dtype: jnp.dtype | None = None,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ):
         super().__init__()
         self.q_head_num = num_heads
@@ -51,6 +53,13 @@ class RadixAttention(nnx.Module):
         self.logit_cap = logit_cap or None
         self.attn_type = attn_type
         self.xai_temperature_len = -1
+        # Static per-tensor fp8 KV scales. Used only when the KV pool dtype is
+        # fp8 (e4m3/e5m2): new K/V are quantized as clip(x/scale) on write and
+        # the scale is folded back into the softmax scale (k_scale) and PV
+        # output (v_scale) on read. Default 1.0 = uncalibrated (matches the
+        # vLLM/tpu-inference default when no calibration is provided).
+        self.k_scale = k_scale
+        self.v_scale = v_scale
         if softmax_dtype is not None:
             softmax_dtype = jnp.dtype(softmax_dtype)
             if not jnp.issubdtype(softmax_dtype, jnp.floating):
