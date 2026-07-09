@@ -409,6 +409,18 @@ class ServerArgs:
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
 
+        # fp8 KV cache production sharding: when the KV pool is fp8 the fused-KV
+        # head axis is 32-bit packed (packing = 32 // bits), so its shardable
+        # size is num_kv_heads*2 // packing -- HALF the bf16 value. If that
+        # collapses below tp_size, plain tensor-parallel would try to split an
+        # axis it can't (e.g. gpt-oss-120b: 8*2//4 = 4 < tp=8 -> crash) or
+        # duplicate KV heads and waste the fp8 capacity win. Mirror the
+        # tpu-inference (vLLM TPU) attn-DP auto-reduce: turn the excess TP into
+        # attention data-parallel so attention_tp = tp // dp exactly saturates
+        # the shardable KV-head axis. Only fires when the user left dp_size at
+        # its default (1); an explicit --dp-size is always respected.
+        self._maybe_auto_dp_for_fp8_kv()
+
         if self.enable_expert_balance_debug and self.expert_balance_segment_counter <= 0:
             raise ValueError("expert_balance_segment_counter must be positive")
 
@@ -1631,6 +1643,100 @@ class ServerArgs:
             **kwargs,
         )
         return hf_config
+
+    def _maybe_auto_dp_for_fp8_kv(self):
+        """Auto-reduce attention-TP (via attention DP) so an fp8 KV cache stays
+        shardable at the requested tp_size.
+
+        The fused-KV RPA v3 cache stores the head axis 32-bit packed, so its
+        shardable size is ``num_kv_heads * 2 // packing`` where
+        ``packing = 32 // bits(kv_dtype)`` (bf16 -> 2, fp8 -> 4). That axis is
+        sharded over the mesh "tensor" axis whose size is
+        ``attention_tp = tp_size // dp_size``. For fp8 it is half the bf16 value
+        and can drop below tp_size, which either crashes (indivisible) or wastes
+        capacity (duplicated heads). This mirrors tpu-inference's attn-DP
+        auto-reduce: pick the smallest dp so ``attention_tp`` evenly divides the
+        shardable axis.
+        """
+        # Only fp8 KV needs this; bf16/fp32/auto keep the full head axis.
+        fp8_bits = {"fp8_e5m2": 8, "fp8_e4m3": 8, "fp8": 8}
+        bits = fp8_bits.get(self.kv_cache_dtype)
+        if bits is None:
+            return
+        # Respect an explicit --dp-size; only auto-derive from the default (1).
+        if self.dp_size != 1:
+            return
+        if self.tp_size <= 1:
+            return
+
+        try:
+            hf_config = self.get_hf_config()
+        except Exception as e:  # pragma: no cover - config load best-effort
+            logger.warning(
+                "fp8 KV auto-DP: could not load HF config (%s); leaving dp_size=1. "
+                "If tp_size does not divide num_kv_heads*2//packing you may need "
+                "--dp-size manually.",
+                e,
+            )
+            return
+
+        text_config = getattr(hf_config, "text_config", hf_config)
+        num_kv_heads = (
+            getattr(text_config, "num_key_value_heads", None)
+            or getattr(hf_config, "num_key_value_heads", None)
+            or getattr(text_config, "num_attention_heads", None)
+        )
+        if not num_kv_heads:
+            return
+
+        packing = 32 // bits  # fp8 -> 4
+        # Shardable size of the fused-KV head axis (K/V interleaved => *2), given
+        # no head replication (the common case; replication only grows the axis).
+        shardable = max(1, (num_kv_heads * 2) // packing)
+
+        attention_tp = self.tp_size // self.dp_size
+        # Already fine: axis divides evenly across the tensor axis.
+        if attention_tp <= shardable and shardable % attention_tp == 0:
+            return
+
+        # Find the smallest dp (dividing tp) whose attention_tp = tp // dp evenly
+        # divides the shardable axis. Prefer the largest attention_tp (smallest
+        # dp) to keep tensor parallelism high.
+        chosen_dp = None
+        dp = 1
+        while dp <= self.tp_size:
+            if self.tp_size % dp == 0:
+                attn_tp = self.tp_size // dp
+                if attn_tp <= shardable and shardable % attn_tp == 0:
+                    chosen_dp = dp
+                    break
+            dp += 1
+        if chosen_dp is None or chosen_dp == 1:
+            logger.warning(
+                "fp8 KV auto-DP: could not find a data-parallel degree that makes "
+                "the fp8 KV head axis (shardable=%d, num_kv_heads=%d, packing=%d) "
+                "divide tp_size=%d. Serving may fail; consider --dp-size manually.",
+                shardable,
+                num_kv_heads,
+                packing,
+                self.tp_size,
+            )
+            return
+
+        logger.warning(
+            "fp8 KV cache (%s) at tp_size=%d collapses the fused-KV head axis to "
+            "shardable=%d (num_kv_heads=%d, packing=%d) < tp_size. Auto-enabling "
+            "attention data-parallel dp_size=%d (attention_tp=%d) so the KV cache "
+            "shards cleanly. Pass an explicit --dp-size to override.",
+            self.kv_cache_dtype,
+            self.tp_size,
+            shardable,
+            num_kv_heads,
+            packing,
+            chosen_dp,
+            self.tp_size // chosen_dp,
+        )
+        self.dp_size = chosen_dp
 
     def check_server_args(self):
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
